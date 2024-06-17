@@ -46,6 +46,26 @@ void resize() {
     close(fd);
 }
 
+void xrfc_conf(void* data, struct xdg_surface *surface, uint32_t serial) {
+    xdg_surface_ack_configure(surface, serial);
+    if(!pixelMemory) {
+        resize();
+    }
+    draw();
+
+    wl_surface_attach(surface, buffer, 0, 0);
+    wl_surface_damage(surface, 0, 0, width, height);
+    wl_surface_commit(surface);
+}
+
+void draw() {
+
+}
+
+struct xdg_surface_listener xrfc_list = {
+    .configure = xrfc_conf
+};
+
 static void registry_handle_global(void *data, struct wl_registry *registry, uint32_t name, const char *interface, uint32_t version) {
     if(!strcmp(interface, wl_compositor_interface.name)) {
         compositor = wl_registry_bind(registry, name, &wl_compositor_interface, 6);
