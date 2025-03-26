@@ -1,5 +1,3 @@
 I am trying to make a wayland app on Linux.
 
-Using this video: [wayland client](https://www.youtube.com/watch?v=iIVIu7YRdY0&t=23s)
-
-current timestamp: 41:05
+I'm heavily using https://developer.orbitrc.io/documentation/wayland/guides/hello-wayland/ as a resource.
