@@ -5,6 +5,13 @@
 #include <wayland-client.h>
 #include "xdg-shell-protocol.h"
 
+#include "shm.c"
+#include <sys/mman.h>
+
+struct wl_shm *shm = NULL;
+struct wl_buffer *buffer = NULL;
+void *shm_data;
+
 struct wl_display *display = NULL;
 struct wl_registry *registry = NULL;
 struct wl_compositor *compositor = NULL;
@@ -43,6 +50,14 @@ static const struct xdg_toplevel_listener xdg_toplevel_listener = {
     .configure = xdg_toplevel_configure_handler
 };
 
+static void shm_format_handler(void *data, struct wl_shm *shm, uint32_t format) {
+    fprintf(stderr, "Format %d\n", format);
+}
+
+static const struct wl_shm_listener shm_listener = {
+    .format = shm_format_handler
+};
+
 static void global_registry_handler(void *data, struct wl_registry *registry, uint32_t id, const char *interface, uint32_t version) {
     printf("Got a registry event for <%s>, id: %d, version: %d\n", interface, id, version);
 
@@ -50,6 +65,9 @@ static void global_registry_handler(void *data, struct wl_registry *registry, ui
         compositor = wl_registry_bind(registry, id, &wl_compositor_interface, version);
     } else if (strcmp(interface, "xdg_wm_base") == 0) {
         xdg_wm_base = wl_registry_bind(registry, id, &xdg_wm_base_interface, 1);
+    } else if (strcmp(interface, "wl_shm") == 0) {
+        shm = wl_registry_bind(registry, id, &wl_shm_interface, 1);
+        wl_shm_add_listener(shm, &shm_listener, NULL);
     }
 }
 
@@ -61,6 +79,33 @@ const static struct wl_registry_listener registry_listener = {
     .global = global_registry_handler,
     .global_remove = global_registry_remove_handler
 };
+
+static struct wl_buffer* create_buffer(int width, int height) {
+    struct wl_shm_pool *pool;
+    int stride = width * 4;
+    int size = stride * height;
+    int fd;
+    struct wl_buffer *buff;
+
+    fd = os_create_anonumous_file(size);
+    if (fd < 0) {
+        fprintf(stderr, "Failed to create a buffer. size: %d\n", size);
+        exit(1);
+    }
+    
+    shm_data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if(shm_data == MAP_FAILED) {
+        fprintf(stderr, "mmap failed!\n");
+        close(fd);
+        exit(1);
+    }
+
+    pool = wl_shm_create_pool(shm, fd, size);
+    buff = wl_shm_pool_create_buffer(pool, 0, width, height, stride, WL_SHM_FORMAT_ARGB8888);
+    wl_shm_pool_destroy(pool);
+
+    return buff;
+}
 
 int main(int argc, char *argv[]) {
     display = wl_display_connect(NULL);
@@ -74,6 +119,8 @@ int main(int argc, char *argv[]) {
 
     wl_display_dispatch(display);
     wl_display_roundtrip(display);
+
+    buffer = create_buffer(480, 360);
 
     if(compositor == NULL) {
         fprintf(stderr, "Could not find a compositor.\n");
@@ -96,7 +143,14 @@ int main(int argc, char *argv[]) {
     xdg_toplevel = xdg_surface_get_toplevel(xdg_surface);
     xdg_toplevel_add_listener(xdg_toplevel, &xdg_toplevel_listener, NULL);
 
+    wl_surface_attach(surface, buffer, 0, 0);
     wl_surface_commit(surface);
+
+    uint32_t *pixel = shm_data;
+    for(int i = 0; i < 480 * 360; ++i) {
+        *pixel = 0x7FFF0000;
+        ++pixel;
+    }
 
     while (wl_display_dispatch(display) != -1) {
         ;
