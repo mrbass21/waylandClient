@@ -2,24 +2,29 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <wayland-client-protocol.h>
 #include <wayland-client.h>
+#include "xdg-decoration.h"
 #include "xdg-shell-protocol.h"
 
 #include "shm.c"
 #include <sys/mman.h>
 
-struct wl_shm *shm = NULL;
-struct wl_buffer *buffer = NULL;
+static struct wl_shm *shm = NULL;
+static struct wl_buffer *buffer = NULL;
 void *shm_data;
 
-struct wl_display *display = NULL;
-struct wl_registry *registry = NULL;
-struct wl_compositor *compositor = NULL;
-struct wl_surface *surface = NULL;
+static struct wl_display *display = NULL;
+static struct wl_registry *registry = NULL;
+static struct wl_compositor *compositor = NULL;
+static struct wl_surface *surface = NULL;
 
-struct xdg_wm_base *xdg_wm_base = NULL;
-struct xdg_surface *xdg_surface = NULL;
-struct xdg_toplevel *xdg_toplevel = NULL;
+static struct xdg_wm_base *xdg_wm_base = NULL;
+static struct xdg_surface *xdg_surface = NULL;
+static struct xdg_toplevel *xdg_toplevel = NULL;
+static struct zxdg_decoration_manager_v1 *decoration_manager = NULL;
+
+bool configured = false;
 
 static void xdg_wm_base_ping_handler(void *data, struct xdg_wm_base *wm_base, uint32_t serial) {
     xdg_wm_base_pong(wm_base, serial);
@@ -31,6 +36,9 @@ static const struct xdg_wm_base_listener xdg_wm_base_listener = {
 
 static void xdg_surface_configure_handler(void *data, struct xdg_surface *xdg_surf, uint32_t serial) {
     xdg_surface_ack_configure(xdg_surf, serial);
+
+    wl_surface_attach(surface, buffer, 0, 0);
+    wl_surface_commit(surface);
 }
 
 static const struct xdg_surface_listener xdg_surface_listener = {
@@ -59,15 +67,20 @@ static const struct wl_shm_listener shm_listener = {
 };
 
 static void global_registry_handler(void *data, struct wl_registry *registry, uint32_t id, const char *interface, uint32_t version) {
-    printf("Got a registry event for <%s>, id: %d, version: %d\n", interface, id, version);
+    // printf("Got a registry event for <%s>, id: %d, version: %d\n", interface, id, version);
 
-    if(strcmp(interface, "wl_compositor") == 0) {
+    if(strcmp(interface, wl_compositor_interface.name) == 0) {
         compositor = wl_registry_bind(registry, id, &wl_compositor_interface, version);
-    } else if (strcmp(interface, "xdg_wm_base") == 0) {
+        printf("Set compositor!\n");
+    } else if (strcmp(interface, xdg_wm_base_interface.name) == 0) {
         xdg_wm_base = wl_registry_bind(registry, id, &xdg_wm_base_interface, 1);
-    } else if (strcmp(interface, "wl_shm") == 0) {
+        printf("Set wm_base!\n");
+    } else if (strcmp(interface, wl_shm_interface.name) == 0) {
         shm = wl_registry_bind(registry, id, &wl_shm_interface, 1);
         wl_shm_add_listener(shm, &shm_listener, NULL);
+        printf("Set SHM listener!\n");
+    } else if( strcmp(interface, zxdg_decoration_manager_v1_interface.name) == 0) {
+        decoration_manager = wl_registry_bind(registry, id, &zxdg_decoration_manager_v1_interface, 1);
     }
 }
 
@@ -116,8 +129,6 @@ int main(int argc, char *argv[]) {
 
     registry = wl_display_get_registry(display);
     wl_registry_add_listener(registry, &registry_listener, NULL);
-
-    wl_display_dispatch(display);
     wl_display_roundtrip(display);
 
     buffer = create_buffer(480, 360);
@@ -127,31 +138,42 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
+    if(xdg_wm_base == NULL) {
+        fprintf(stderr, "xdg-shell not available\n");
+        exit(1);
+    }
+
+    if(decoration_manager == NULL) {
+        fprintf(stderr, "xdg-decoration not available\n");
+        exit(1);
+    }
+
     surface = wl_compositor_create_surface(compositor);
     if(surface == NULL) {
         fprintf(stderr, "Failed to create a surface.\n");
         exit(1);
     }
-
-    printf("Created a surface!\n");
-
-    xdg_wm_base_add_listener(xdg_wm_base, &xdg_wm_base_listener, NULL);
-
-    xdg_surface = xdg_wm_base_get_xdg_surface(xdg_wm_base, surface);
-    xdg_surface_add_listener(xdg_surface, &xdg_surface_listener, NULL);
-
-    xdg_toplevel = xdg_surface_get_toplevel(xdg_surface);
-    xdg_toplevel_add_listener(xdg_toplevel, &xdg_toplevel_listener, NULL);
-
-    wl_surface_attach(surface, buffer, 0, 0);
-    wl_surface_commit(surface);
-
+ 
     uint32_t *pixel = shm_data;
     for(int i = 0; i < 480 * 360; ++i) {
-        *pixel = 0x7FFF0000;
+        *pixel = 0xFFFFFFFF;
         ++pixel;
     }
 
+    xdg_surface = xdg_wm_base_get_xdg_surface(xdg_wm_base, surface);
+    xdg_toplevel = xdg_surface_get_toplevel(xdg_surface);
+
+    xdg_surface_add_listener(xdg_surface, &xdg_surface_listener, NULL);
+    xdg_toplevel_add_listener(xdg_toplevel, &xdg_toplevel_listener, NULL);
+
+    wl_display_roundtrip(display);
+
+    // Trigger a configure event
+    wl_surface_commit(surface);
+
+    //wl_surface_attach(surface, buffer, 0, 0);
+    //wl_surface_commit(surface);
+    
     while (wl_display_dispatch(display) != -1) {
         ;
     }
