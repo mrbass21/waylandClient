@@ -24,7 +24,7 @@ static struct xdg_surface *xdg_surface = NULL;
 static struct xdg_toplevel *xdg_toplevel = NULL;
 static struct zxdg_decoration_manager_v1 *decoration_manager = NULL;
 
-bool configured = false;
+static int running = 1;
 
 static void xdg_wm_base_ping_handler(void *data, struct xdg_wm_base *wm_base, uint32_t serial) {
     xdg_wm_base_pong(wm_base, serial);
@@ -34,8 +34,19 @@ static const struct xdg_wm_base_listener xdg_wm_base_listener = {
     .ping = xdg_wm_base_ping_handler
 };
 
+void redraw_frame() {
+    fprintf(stdout, "Redrawing frame!\n");    
+    uint32_t *pixel = shm_data;
+    for(int i = 0; i < 480 * 360; ++i) {
+        *pixel = 0xFFFF00FF;
+        ++pixel;
+    }
+}
+
 static void xdg_surface_configure_handler(void *data, struct xdg_surface *xdg_surf, uint32_t serial) {
     xdg_surface_ack_configure(xdg_surf, serial);
+
+    redraw_frame();
 
     wl_surface_attach(surface, buffer, 0, 0);
     wl_surface_commit(surface);
@@ -50,7 +61,8 @@ static void xdg_toplevel_configure_handler(void *data, struct xdg_toplevel *topl
 }
 
 static void xdg_toplevel_close_handler(void *data, struct xdg_toplevel *toplevel) {
-
+    printf("Close requested!\n");
+    running = 0;
 }
 
 static const struct xdg_toplevel_listener xdg_toplevel_listener = {
@@ -74,6 +86,7 @@ static void global_registry_handler(void *data, struct wl_registry *registry, ui
         printf("Set compositor!\n");
     } else if (strcmp(interface, xdg_wm_base_interface.name) == 0) {
         xdg_wm_base = wl_registry_bind(registry, id, &xdg_wm_base_interface, 1);
+        xdg_wm_base_add_listener(xdg_wm_base, &xdg_wm_base_listener, NULL);
         printf("Set wm_base!\n");
     } else if (strcmp(interface, wl_shm_interface.name) == 0) {
         shm = wl_registry_bind(registry, id, &wl_shm_interface, 1);
@@ -153,12 +166,6 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Failed to create a surface.\n");
         exit(1);
     }
- 
-    uint32_t *pixel = shm_data;
-    for(int i = 0; i < 480 * 360; ++i) {
-        *pixel = 0xFFFFFFFF;
-        ++pixel;
-    }
 
     xdg_surface = xdg_wm_base_get_xdg_surface(xdg_wm_base, surface);
     xdg_toplevel = xdg_surface_get_toplevel(xdg_surface);
@@ -168,13 +175,13 @@ int main(int argc, char *argv[]) {
 
     wl_display_roundtrip(display);
 
+    struct zxdg_toplevel_decoration_v1 *toplevel_decoration =  zxdg_decoration_manager_v1_get_toplevel_decoration(decoration_manager, xdg_toplevel);
+    zxdg_toplevel_decoration_v1_set_mode(toplevel_decoration, ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+
     // Trigger a configure event
     wl_surface_commit(surface);
 
-    //wl_surface_attach(surface, buffer, 0, 0);
-    //wl_surface_commit(surface);
-    
-    while (wl_display_dispatch(display) != -1) {
+    while (wl_display_dispatch(display) != -1 && running == 1) {
         ;
     }
 
