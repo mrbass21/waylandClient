@@ -1,6 +1,5 @@
+#include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 
 #include <wayland-client-protocol.h>
 #include <wayland-client.h>
@@ -12,6 +11,7 @@
 
 static struct wl_shm *shm = NULL;
 static struct wl_buffer *buffer = NULL;
+static uint64_t current_buffer_size = 0;
 void *shm_data;
 
 static struct wl_display *display = NULL;
@@ -24,7 +24,54 @@ static struct xdg_surface *xdg_surface = NULL;
 static struct xdg_toplevel *xdg_toplevel = NULL;
 static struct zxdg_decoration_manager_v1 *decoration_manager = NULL;
 
+#define BACKGROUND_COLOR 0xFF00FF00; //ARGB
+
+#define MIN_WIDTH 480
+#define MIN_HEIGHT 320
+
+static uint32_t window_width = MIN_WIDTH;
+static uint32_t window_height = MIN_HEIGHT;
+
 static int running = 1;
+
+static struct wl_buffer* create_buffer(int width, int height) {
+    printf("Create Buffer!\n");
+    struct wl_shm_pool *pool;
+    int stride = width * 4;
+    int size = stride * height;
+    int fd;
+    static int old_fd = -1;
+    struct wl_buffer *buff;
+
+    fd = os_create_anonumous_file(size);
+    if (fd < 0) {
+        fprintf(stderr, "Failed to create a buffer. size: %d\n", size);
+        exit(1);
+    }
+
+    if(shm_data != NULL) {
+        munmap(shm_data, current_buffer_size);
+    }
+
+    if(old_fd > 0) {
+        close(old_fd);
+    }
+    
+    shm_data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if(shm_data == MAP_FAILED) {
+        fprintf(stderr, "mmap failed!\n");
+        close(fd);
+        exit(1);
+    }
+
+    pool = wl_shm_create_pool(shm, fd, size);
+    buff = wl_shm_pool_create_buffer(pool, 0, width, height, stride, WL_SHM_FORMAT_ARGB8888);
+    wl_shm_pool_destroy(pool);
+
+    current_buffer_size = size;
+    old_fd = fd;
+    return buff;
+}
 
 static void xdg_wm_base_ping_handler(void *data, struct xdg_wm_base *wm_base, uint32_t serial) {
     xdg_wm_base_pong(wm_base, serial);
@@ -37,14 +84,20 @@ static const struct xdg_wm_base_listener xdg_wm_base_listener = {
 void redraw_frame() {
     fprintf(stdout, "Redrawing frame!\n");    
     uint32_t *pixel = shm_data;
-    for(int i = 0; i < 480 * 360; ++i) {
-        *pixel = 0xFFFF00FF;
+    for(int i = 0; i < window_height * window_width; ++i) {
+        *pixel = BACKGROUND_COLOR;
         ++pixel;
     }
 }
 
 static void xdg_surface_configure_handler(void *data, struct xdg_surface *xdg_surf, uint32_t serial) {
     xdg_surface_ack_configure(xdg_surf, serial);
+
+    if(buffer != NULL) {
+        wl_buffer_destroy(buffer);
+    }
+
+    buffer = create_buffer(window_width, window_height);
 
     redraw_frame();
 
@@ -58,6 +111,8 @@ static const struct xdg_surface_listener xdg_surface_listener = {
 
 static void xdg_toplevel_configure_handler(void *data, struct xdg_toplevel *toplevel, int32_t width, int32_t height, struct wl_array *states) {
     fprintf(stderr, "XDG toplevel configure: %dx%d\n", width, height);
+    window_height = (height >= MIN_HEIGHT) ? height : MIN_HEIGHT;
+    window_width = (width >= MIN_WIDTH) ? width : MIN_WIDTH;
 }
 
 static void xdg_toplevel_close_handler(void *data, struct xdg_toplevel *toplevel) {
@@ -106,33 +161,6 @@ const static struct wl_registry_listener registry_listener = {
     .global_remove = global_registry_remove_handler
 };
 
-static struct wl_buffer* create_buffer(int width, int height) {
-    struct wl_shm_pool *pool;
-    int stride = width * 4;
-    int size = stride * height;
-    int fd;
-    struct wl_buffer *buff;
-
-    fd = os_create_anonumous_file(size);
-    if (fd < 0) {
-        fprintf(stderr, "Failed to create a buffer. size: %d\n", size);
-        exit(1);
-    }
-    
-    shm_data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if(shm_data == MAP_FAILED) {
-        fprintf(stderr, "mmap failed!\n");
-        close(fd);
-        exit(1);
-    }
-
-    pool = wl_shm_create_pool(shm, fd, size);
-    buff = wl_shm_pool_create_buffer(pool, 0, width, height, stride, WL_SHM_FORMAT_ARGB8888);
-    wl_shm_pool_destroy(pool);
-
-    return buff;
-}
-
 int main(int argc, char *argv[]) {
     display = wl_display_connect(NULL);
     if(display == NULL) {
@@ -144,7 +172,8 @@ int main(int argc, char *argv[]) {
     wl_registry_add_listener(registry, &registry_listener, NULL);
     wl_display_roundtrip(display);
 
-    buffer = create_buffer(480, 360);
+    buffer = create_buffer(MIN_WIDTH, MIN_HEIGHT);
+    current_buffer_size = MIN_WIDTH * MIN_HEIGHT * 4;
 
     if(compositor == NULL) {
         fprintf(stderr, "Could not find a compositor.\n");

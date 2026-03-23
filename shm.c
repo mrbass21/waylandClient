@@ -2,6 +2,8 @@
 #include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <stdlib.h>
+#include <string.h>
 
 static int set_cloexec_or_close(int fd) {
     long flags;
