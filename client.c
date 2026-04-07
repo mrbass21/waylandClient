@@ -43,6 +43,10 @@ static struct client_keyboard_state {
     struct xkb_context *context;
     struct xkb_keymap *keymap;
     struct xkb_state *state;
+    int32_t repeat_rate;      // characters per second (0 = disabled)
+    int32_t repeat_delay;     // milliseconds before repeat starts
+    uint32_t repeat_key;      // key code currently repeating
+    uint32_t repeat_start_time; // when the key was pressed
 } keyboard_state;
 
 static struct wl_buffer* create_buffer(int width, int height) {
@@ -176,9 +180,11 @@ static void wl_keyboard_modifiers_handler(void *data, struct wl_keyboard *keyboa
 }
 
 static void wl_keyboard_repeat_info_handler(void *data, struct wl_keyboard *keyboard, int32_t rate, int32_t delay) {
+    struct client_keyboard_state *client_state = data;
+    client_state->repeat_rate = rate;
+    client_state->repeat_delay = delay;
     fprintf(stderr, "Key repeat info: rate %d, delay %d\n", rate, delay);
-   //struct client_keyboard_state *client_state = data;
-    //xkb_keymap_key_repeats(client_state->keymap, rate > 0);
+    fprintf(stderr, "Compositor will handle repeats: %s\n", (rate == 0) ? "Yes (via REPEATED state)" : "No (client handles)");
 }
 
 static void wl_keyboard_key_handler(void *data, struct wl_keyboard *keyboard, uint32_t serial, uint32_t time, uint32_t key, uint32_t state) {
@@ -187,7 +193,26 @@ static void wl_keyboard_key_handler(void *data, struct wl_keyboard *keyboard, ui
     uint32_t keycode = key + 8; // xkbcommon adds an offset of 8 to the keycodes, so we need to add 8 to get the correct keycode.
     xkb_keysym_t sym = xkb_state_key_get_one_sym(client_state->state, keycode);
     xkb_keysym_get_name(sym, buf, sizeof(buf));
-    const char *action = (state == WL_KEYBOARD_KEY_STATE_PRESSED) ? "pressed" : "released";
+    
+    const char *action;
+    if (state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+        action = "pressed";
+        // Track this key for repeat handling if client is responsible
+        if (client_state->repeat_rate > 0) {
+            client_state->repeat_key = key;
+            client_state->repeat_start_time = time;
+        }
+    } else if (state == WL_KEYBOARD_KEY_STATE_REPEATED) {
+        action = "repeated";
+    } else {
+        action = "released";
+        // Stop tracking this key
+        if (client_state->repeat_key == key) {
+            client_state->repeat_key = 0;
+            client_state->repeat_start_time = 0;
+        }
+    }
+    
     fprintf(stderr, "Key %s: %s (keycode: %d, sym: %d)\n", action, buf, keycode, sym);
     xkb_state_key_get_utf8(client_state->state, keycode, buf, sizeof(buf));
     fprintf(stderr, "UTF-8: %s\n", buf);
