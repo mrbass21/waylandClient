@@ -63,7 +63,7 @@ static int create_tmpfile_cloexec(char *tmpname) {
  * SCM_RIGHTS methods.
  */
 
- int os_create_anonumous_file(off_t size) {
+ int os_create_anonymous_file(off_t size) {
     static const char template[] = "/tutorial-shared-XXXXXX";
     const char *path;
     char *name;

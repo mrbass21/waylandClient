@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include <stdio.h>
+#include <stdbool.h>
 
 #include <wayland-client-protocol.h>
 #include <wayland-client.h>
@@ -8,6 +9,7 @@
 
 #include "shm.c"
 #include <sys/mman.h>
+#include <xkbcommon/xkbcommon.h>
 
 static struct wl_shm *shm = NULL;
 static struct wl_buffer *buffer = NULL;
@@ -23,6 +25,9 @@ static struct xdg_wm_base *xdg_wm_base = NULL;
 static struct xdg_surface *xdg_surface = NULL;
 static struct xdg_toplevel *xdg_toplevel = NULL;
 static struct zxdg_decoration_manager_v1 *decoration_manager = NULL;
+static struct wl_seat *wayland_seat = NULL;
+static struct wl_keyboard *keyboard = NULL;
+static bool keyboardConnected = false;
 
 #define BACKGROUND_COLOR 0xFF00FF00; //ARGB
 
@@ -34,6 +39,12 @@ static uint32_t window_height = MIN_HEIGHT;
 
 static int running = 1;
 
+static struct client_keyboard_state {
+    struct xkb_context *context;
+    struct xkb_keymap *keymap;
+    struct xkb_state *state;
+} keyboard_state;
+
 static struct wl_buffer* create_buffer(int width, int height) {
     printf("Create Buffer!\n");
     struct wl_shm_pool *pool;
@@ -43,7 +54,7 @@ static struct wl_buffer* create_buffer(int width, int height) {
     static int old_fd = -1;
     struct wl_buffer *buff;
 
-    fd = os_create_anonumous_file(size);
+    fd = os_create_anonymous_file(size);
     if (fd < 0) {
         fprintf(stderr, "Failed to create a buffer. size: %d\n", size);
         exit(1);
@@ -129,8 +140,107 @@ static void shm_format_handler(void *data, struct wl_shm *shm, uint32_t format) 
     fprintf(stderr, "Format %d\n", format);
 }
 
+// keyboard handlers
+static void keyboard_keymap_handler(void *data, struct wl_keyboard *keyboard, uint32_t format, int fd, uint32_t size) {
+    struct client_keyboard_state *client_state = data;
+
+    if(format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1) {
+        fprintf(stderr, "Unknown keymap format: %d\n", format);
+        close(fd);
+        return;
+    }
+
+    char *map_shm = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
+    if(map_shm == MAP_FAILED) {
+        fprintf(stderr, "Failed to mmap keymap!\n");
+        close(fd);
+        return;
+    }
+    client_state->keymap = xkb_keymap_new_from_string(client_state->context, map_shm, XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS);
+    munmap(map_shm, size);
+    close(fd);
+    if(client_state->keymap == NULL) {
+        fprintf(stderr, "Failed to compile keymap!\n");
+        return;
+    }
+
+    struct xkb_state *state = xkb_state_new(client_state->keymap);
+    xkb_keymap_unref(client_state->keymap);
+    xkb_state_unref(client_state->state);
+    client_state->state = state;  
+}
+
+static void wl_keyboard_modifiers_handler(void *data, struct wl_keyboard *keyboard, uint32_t serial, uint32_t mods_depressed, uint32_t mods_latched, uint32_t mods_locked, uint32_t group) {
+    struct client_keyboard_state *client_state = data;
+    xkb_state_update_mask(client_state->state, mods_depressed, mods_latched, mods_locked, 0, 0, group);
+}
+
+static void wl_keyboard_repeat_info_handler(void *data, struct wl_keyboard *keyboard, int32_t rate, int32_t delay) {
+    fprintf(stderr, "Key repeat info: rate %d, delay %d\n", rate, delay);
+   //struct client_keyboard_state *client_state = data;
+    //xkb_keymap_key_repeats(client_state->keymap, rate > 0);
+}
+
+static void wl_keyboard_key_handler(void *data, struct wl_keyboard *keyboard, uint32_t serial, uint32_t time, uint32_t key, uint32_t state) {
+    struct client_keyboard_state *client_state = data;
+    char buf[128];
+    uint32_t keycode = key + 8; // xkbcommon adds an offset of 8 to the keycodes, so we need to add 8 to get the correct keycode.
+    xkb_keysym_t sym = xkb_state_key_get_one_sym(client_state->state, keycode);
+    xkb_keysym_get_name(sym, buf, sizeof(buf));
+    const char *action = (state == WL_KEYBOARD_KEY_STATE_PRESSED) ? "pressed" : "released";
+    fprintf(stderr, "Key %s: %s (keycode: %d, sym: %d)\n", action, buf, keycode, sym);
+    xkb_state_key_get_utf8(client_state->state, keycode, buf, sizeof(buf));
+    fprintf(stderr, "UTF-8: %s\n", buf);
+}
+
+static void wl_keyboard_enter_handler(void *data, struct wl_keyboard *keyboard, uint32_t serial, struct wl_surface *surface, struct wl_array *keys) {
+    fprintf(stderr, "Keyboard entered surface!\n");
+}
+
+static void wl_keyboard_leave_handler(void *data, struct wl_keyboard *keyboard, uint32_t serial, struct wl_surface *surface) {
+    fprintf(stderr, "Keyboard left surface!\n");
+}
+
+static const struct wl_keyboard_listener keyboard_listener = {
+    .keymap = keyboard_keymap_handler,
+    .enter = wl_keyboard_enter_handler,
+    .leave = wl_keyboard_leave_handler,
+    .key = wl_keyboard_key_handler,
+    .modifiers = wl_keyboard_modifiers_handler,
+    .repeat_info = wl_keyboard_repeat_info_handler
+};
+
+// wl_seat handler
+static void seat_capabilities_handler(void *data, struct wl_seat *seat, uint32_t capabilities) {
+    printf("Seat capabilities changed! %d\n", capabilities);
+    struct client_keyboard_state *client_state = data;
+    if(capabilities & WL_SEAT_CAPABILITY_KEYBOARD) {
+        printf("Keyboard is supported!\n");
+        keyboardConnected = true;
+        
+        keyboard = wl_seat_get_keyboard(seat);
+        wl_keyboard_add_listener(keyboard, &keyboard_listener, client_state);
+    } else {
+        printf("Keyboard is not supported!\n");
+        keyboardConnected = false;
+        if(keyboard != NULL) {
+            wl_keyboard_release(keyboard);
+            keyboard = NULL;
+        }
+    }
+}
+
+static void seat_name_handler(void *data, struct wl_seat *seat, const char *name) {
+    printf("Seat name: %s\n", name);
+}
+
 static const struct wl_shm_listener shm_listener = {
     .format = shm_format_handler
+};
+
+static const struct wl_seat_listener seat_listener = {
+    .capabilities = seat_capabilities_handler,
+    .name = seat_name_handler
 };
 
 static void global_registry_handler(void *data, struct wl_registry *registry, uint32_t id, const char *interface, uint32_t version) {
@@ -149,6 +259,9 @@ static void global_registry_handler(void *data, struct wl_registry *registry, ui
         printf("Set SHM listener!\n");
     } else if( strcmp(interface, zxdg_decoration_manager_v1_interface.name) == 0) {
         decoration_manager = wl_registry_bind(registry, id, &zxdg_decoration_manager_v1_interface, 1);
+    } else if( strcmp(interface, wl_seat_interface.name) == 0) {
+        wayland_seat = wl_registry_bind(registry, id, &wl_seat_interface, 7);
+        wl_seat_add_listener(wayland_seat, &seat_listener, data);
     }
 }
 
@@ -168,8 +281,11 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
+    struct client_keyboard_state keyboard_state = {0};
+    keyboard_state.context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+
     registry = wl_display_get_registry(display);
-    wl_registry_add_listener(registry, &registry_listener, NULL);
+    wl_registry_add_listener(registry, &registry_listener, &keyboard_state);
     wl_display_roundtrip(display);
 
     buffer = create_buffer(MIN_WIDTH, MIN_HEIGHT);
@@ -207,7 +323,7 @@ int main(int argc, char *argv[]) {
     struct zxdg_toplevel_decoration_v1 *toplevel_decoration =  zxdg_decoration_manager_v1_get_toplevel_decoration(decoration_manager, xdg_toplevel);
     zxdg_toplevel_decoration_v1_set_mode(toplevel_decoration, ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
 
-    // Trigger a configure event
+    // Trigger a configure event. We do this to set an initial size for the window, and to get the initial configure event with the correct size from the compositor.
     wl_surface_commit(surface);
 
     while (wl_display_dispatch(display) != -1 && running == 1) {
@@ -215,6 +331,10 @@ int main(int argc, char *argv[]) {
     }
 
     wl_surface_destroy(surface);
+    wl_seat_destroy(wayland_seat);
+    zxdg_decoration_manager_v1_destroy(decoration_manager);
+    xdg_toplevel_destroy(xdg_toplevel);
+    xdg_surface_destroy(xdg_surface);
 
     wl_display_disconnect(display);
     printf("Disconnected from the display!\n");

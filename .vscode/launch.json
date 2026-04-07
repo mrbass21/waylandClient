@@ -8,8 +8,8 @@
       "args": [],
       "stopAtEntry": false,
       "externalConsole": false,
-      "cwd": "/home/beck/Developer/waylandClient",
-      "program": "/home/beck/Developer/waylandClient/build/Debug/outDebug",
+      "cwd": "${workspaceFolder}",
+      "program": "${workspaceFolder}/build/client",
       "MIMode": "gdb",
       "miDebuggerPath": "gdb",
       "setupCommands": [
