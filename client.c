@@ -15,7 +15,7 @@
 #include <unistd.h>
 #include <linux/joystick.h>
 #include <poll.h>
-#include <time.h>
+#include <sys/time.h>
 
 static struct wl_shm *shm = NULL;
 static struct wl_buffer *buffer = NULL;
@@ -513,9 +513,9 @@ int main(int argc, char *argv[]) {
 
     while (running == 1) {
         uint64_t frame_start = 0;
-        struct timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        frame_start = ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        frame_start = tv.tv_sec * 1000000LL + tv.tv_usec;
         
         // Update game state and render
         redraw_frame();
@@ -555,8 +555,8 @@ int main(int argc, char *argv[]) {
         
         // Sleep for remaining frame time
         uint64_t frame_end;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        frame_end = ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
+        gettimeofday(&tv, NULL);
+        frame_end = tv.tv_sec * 1000000LL + tv.tv_usec;
         
         uint64_t elapsed = frame_end - frame_start;
         if (elapsed < FRAME_TIME_US) {
