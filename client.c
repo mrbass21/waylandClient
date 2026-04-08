@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <linux/joystick.h>
 #include <poll.h>
+#include <time.h>
 
 static struct wl_shm *shm = NULL;
 static struct wl_buffer *buffer = NULL;
@@ -508,8 +509,14 @@ int main(int argc, char *argv[]) {
 
     #define TARGET_FPS 60
     #define FRAME_TIME_MS (1000 / TARGET_FPS)  // 16ms for 60 FPS
+    #define FRAME_TIME_US (FRAME_TIME_MS * 1000)
 
     while (running == 1) {
+        uint64_t frame_start = 0;
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        frame_start = ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
+        
         // Update game state and render
         redraw_frame();
         
@@ -534,17 +541,26 @@ int main(int argc, char *argv[]) {
         // Process gamepad input
         process_gamepad_input();
         
-        // Wait for events with frame time timeout to maintain FPS while staying responsive
+        // Check for events without blocking (timeout 0)
         struct pollfd fds[1];
         fds[0].fd = wl_display_get_fd(display);
         fds[0].events = POLLIN;
         
-        int ret = poll(fds, 1, FRAME_TIME_MS);
-        if (ret > 0 && fds[0].revents & POLLIN) {
+        if (poll(fds, 1, 0) > 0 && fds[0].revents & POLLIN) {
             if (wl_display_dispatch(display) == -1) {
                 fprintf(stderr, "Wayland dispatch error!\n");
                 break;
             }
+        }
+        
+        // Sleep for remaining frame time
+        uint64_t frame_end;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        frame_end = ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
+        
+        uint64_t elapsed = frame_end - frame_start;
+        if (elapsed < FRAME_TIME_US) {
+            usleep(FRAME_TIME_US - elapsed);
         }
     }
 
