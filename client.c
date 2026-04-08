@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdbool.h>
+#include <stdlib.h>
 
 #include <wayland-client-protocol.h>
 #include <wayland-client.h>
@@ -10,6 +11,10 @@
 #include "shm.c"
 #include <sys/mman.h>
 #include <xkbcommon/xkbcommon.h>
+#include <libudev.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <linux/joystick.h>
 
 static struct wl_shm *shm = NULL;
 static struct wl_buffer *buffer = NULL;
@@ -28,6 +33,10 @@ static struct zxdg_decoration_manager_v1 *decoration_manager = NULL;
 static struct wl_seat *wayland_seat = NULL;
 static struct wl_keyboard *keyboard = NULL;
 static bool keyboardConnected = false;
+
+#define MAX_GAMEPADS 4
+static int gamepad_fds[MAX_GAMEPADS] = {-1, -1, -1, -1};
+static int gamepad_count_active = 0;
 
 #define BACKGROUND_COLOR 0xFF00FF00; //ARGB
 
@@ -299,6 +308,135 @@ const static struct wl_registry_listener registry_listener = {
     .global_remove = global_registry_remove_handler
 };
 
+static void process_gamepad_input() {
+    struct js_event event;
+    
+    for (int i = 0; i < gamepad_count_active; i++) {
+        if (gamepad_fds[i] < 0) continue;
+        
+        // Read all pending events from this gamepad
+        while (read(gamepad_fds[i], &event, sizeof(event)) == sizeof(event)) {
+            // Ignore initial calibration events
+            if (event.type & JS_EVENT_INIT) continue;
+            
+            if (event.type == JS_EVENT_BUTTON) {
+                const char *button_names[] = {
+                    "X", "O", "Triangle", "Square",
+                    "L1", "R1", "L2", "R2",
+                    "Select", "Start", "Center Button", 
+                    "L3", "R3", 
+                    "DPAD UP", "DPAD DOWN", "DPAD LEFT", "DPAD RIGHT"
+                };
+                
+                if (event.number < sizeof(button_names) / sizeof(button_names[0])) {
+                    fprintf(stderr, "Gamepad %d: Button %s %s\n", 
+                            i, button_names[event.number], 
+                            event.value ? "pressed" : "released");
+                }
+            } else if (event.type == JS_EVENT_AXIS) {
+                const char *axis_names[] = {
+                    "Left Stick X", "Left Stick Y", 
+                    "Right Stick X", "Right Stick Y",
+                    "L2 Analog", "R2 Analog"
+                };
+                
+                if (event.number < sizeof(axis_names) / sizeof(axis_names[0])) {
+                    // Only print significant movements to reduce spam
+                    if (abs(event.value) > 5000) {
+                        fprintf(stderr, "Gamepad %d: %s = %d\n", 
+                                i, axis_names[event.number], event.value);
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void close_gamepads() {
+    for (int i = 0; i < gamepad_count_active; i++) {
+        if (gamepad_fds[i] >= 0) {
+            close(gamepad_fds[i]);
+            gamepad_fds[i] = -1;
+        }
+    }
+    gamepad_count_active = 0;
+}
+
+static void scanForGamepads() {
+    fprintf(stderr, "Scanning for gamepads...\n");
+    struct udev *udev = udev_new();
+    if (!udev) {
+        fprintf(stderr, "Failed to create udev context\n");
+        return;
+    }
+    
+    struct udev_enumerate *enumerate = udev_enumerate_new(udev);
+    if (!enumerate) {
+        fprintf(stderr, "Failed to create udev enumerate\n");
+        udev_unref(udev);
+        return;
+    }
+    
+    // Enumerate input devices with joystick devtype (more reliable)
+    udev_enumerate_add_match_subsystem(enumerate, "input");
+    udev_enumerate_add_match_property(enumerate, "ID_INPUT_JOYSTICK", "1");
+    udev_enumerate_scan_devices(enumerate);
+    struct udev_list_entry *devices = udev_enumerate_get_list_entry(enumerate);
+    struct udev_list_entry *entry;
+    
+    int gamepad_count = 0;
+
+    udev_list_entry_foreach(entry, devices) {
+        const char *path = udev_list_entry_get_name(entry);
+        struct udev_device *device = udev_device_new_from_syspath(udev, path);
+        if (!device) {
+            continue;
+        }
+        
+        const char *devnode = udev_device_get_devnode(device);
+        const char *name = udev_device_get_sysattr_value(device, "name");
+        
+        fprintf(stderr, "Found input device: %s at %s\n", name ? name : "Unknown", devnode ? devnode : "No devnode");
+        
+        // Check if this is a joystick/gamepad device by devnode pattern
+        if (devnode && strstr(devnode, "js")) {
+            // Try to get the name from parent device if not available
+            const char *gamepad_name = name;
+            if (!gamepad_name) {
+                struct udev_device *parent = udev_device_get_parent(device);
+                if (parent) {
+                    gamepad_name = udev_device_get_sysattr_value(parent, "name");
+                }
+            }
+            
+            printf("Found gamepad: %s at %s\n", gamepad_name ? gamepad_name : "Unknown Gamepad", devnode);
+            
+            // Try to open the device
+            if (gamepad_count_active < MAX_GAMEPADS) {
+                int fd = open(devnode, O_RDONLY | O_NONBLOCK);
+                if (fd >= 0) {
+                    gamepad_fds[gamepad_count_active] = fd;
+                    printf("Opened gamepad device at index %d\n", gamepad_count_active);
+                    gamepad_count_active++;
+                } else {
+                    fprintf(stderr, "Failed to open gamepad device: %s\n", devnode);
+                }
+            }
+            
+            gamepad_count++;
+        }
+
+        udev_device_unref(device);
+    }
+    
+    if (gamepad_count == 0) {
+        fprintf(stderr, "No gamepads found\n");
+    }
+
+    udev_enumerate_unref(enumerate);
+    udev_unref(udev);
+}
+
 int main(int argc, char *argv[]) {
     display = wl_display_connect(NULL);
     if(display == NULL) {
@@ -351,9 +489,23 @@ int main(int argc, char *argv[]) {
     // Trigger a configure event. We do this to set an initial size for the window, and to get the initial configure event with the correct size from the compositor.
     wl_surface_commit(surface);
 
-    while (wl_display_dispatch(display) != -1 && running == 1) {
-        ;
+    // Find game pads
+    scanForGamepads();
+
+    while (running == 1) {
+        // Process any pending Wayland events without blocking
+        if (wl_display_dispatch_pending(display) == -1) {
+            break;
+        }
+        
+        // Process gamepad input
+        process_gamepad_input();
+        
+        // Small sleep to prevent busy-waiting
+        usleep(16000); // ~60 FPS
     }
+
+    close_gamepads();
 
     wl_surface_destroy(surface);
     wl_seat_destroy(wayland_seat);
@@ -362,7 +514,4 @@ int main(int argc, char *argv[]) {
     xdg_surface_destroy(xdg_surface);
 
     wl_display_disconnect(display);
-    printf("Disconnected from the display!\n");
-
-    return 0;
 }
