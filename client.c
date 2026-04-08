@@ -1,7 +1,6 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdbool.h>
-#include <stdlib.h>
 
 #include <wayland-client-protocol.h>
 #include <wayland-client.h>
@@ -15,6 +14,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <linux/joystick.h>
+#include <poll.h>
 
 static struct wl_shm *shm = NULL;
 static struct wl_buffer *buffer = NULL;
@@ -47,6 +47,7 @@ static uint32_t window_width = MIN_WIDTH;
 static uint32_t window_height = MIN_HEIGHT;
 
 static int running = 1;
+static int frame_ready = 0;
 
 static struct client_keyboard_state {
     struct xkb_context *context;
@@ -106,13 +107,21 @@ static const struct xdg_wm_base_listener xdg_wm_base_listener = {
 };
 
 void redraw_frame() {
-    fprintf(stdout, "Redrawing frame!\n");    
+    //fprintf(stdout, "Redrawing frame!\n");    
     uint32_t *pixel = shm_data;
     for(int i = 0; i < window_height * window_width; ++i) {
         *pixel = BACKGROUND_COLOR;
         ++pixel;
     }
 }
+static void frame_callback_handler(void *data, struct wl_callback *callback, uint32_t time) {
+    wl_callback_destroy(callback);
+    frame_ready = 1;
+}
+
+static const struct wl_callback_listener frame_callback_listener = {
+    .done = frame_callback_handler
+};
 
 static void xdg_surface_configure_handler(void *data, struct xdg_surface *xdg_surf, uint32_t serial) {
     xdg_surface_ack_configure(xdg_surf, serial);
@@ -122,8 +131,6 @@ static void xdg_surface_configure_handler(void *data, struct xdg_surface *xdg_su
     }
 
     buffer = create_buffer(window_width, window_height);
-
-    redraw_frame();
 
     wl_surface_attach(surface, buffer, 0, 0);
     wl_surface_commit(surface);
@@ -488,21 +495,57 @@ int main(int argc, char *argv[]) {
 
     // Trigger a configure event. We do this to set an initial size for the window, and to get the initial configure event with the correct size from the compositor.
     wl_surface_commit(surface);
+    wl_display_roundtrip(display);
+
+    // Verify buffer is attached after configure
+    if(buffer == NULL) {
+        fprintf(stderr, "ERROR: Buffer is NULL after configure!\n");
+        exit(1);
+    }
 
     // Find game pads
     scanForGamepads();
 
+    #define TARGET_FPS 60
+    #define FRAME_TIME_MS (1000 / TARGET_FPS)  // 16ms for 60 FPS
+
     while (running == 1) {
-        // Process any pending Wayland events without blocking
-        if (wl_display_dispatch_pending(display) == -1) {
-            break;
+        // Update game state and render
+        redraw_frame();
+        
+        // Commit the buffer to Wayland
+        wl_surface_attach(surface, buffer, 0, 0);
+        wl_surface_damage(surface, 0, 0, window_width, window_height);
+        wl_surface_commit(surface);
+        
+        // Flush to ensure requests reach compositor
+        wl_display_flush(display);
+        
+        // Check if buffer needs to be recreated due to window resize
+        if (buffer != NULL) {
+            uint64_t required_size = (uint64_t)window_width * window_height * 4;
+            if (required_size != current_buffer_size) {
+                fprintf(stderr, "Buffer size mismatch, recreating buffer: %lu vs %lu\n", required_size, current_buffer_size);
+                wl_buffer_destroy(buffer);
+                buffer = create_buffer(window_width, window_height);
+            }
         }
         
         // Process gamepad input
         process_gamepad_input();
         
-        // Small sleep to prevent busy-waiting
-        usleep(16000); // ~60 FPS
+        // Wait for events with frame time timeout to maintain FPS while staying responsive
+        struct pollfd fds[1];
+        fds[0].fd = wl_display_get_fd(display);
+        fds[0].events = POLLIN;
+        
+        int ret = poll(fds, 1, FRAME_TIME_MS);
+        if (ret > 0 && fds[0].revents & POLLIN) {
+            if (wl_display_dispatch(display) == -1) {
+                fprintf(stderr, "Wayland dispatch error!\n");
+                break;
+            }
+        }
     }
 
     close_gamepads();
