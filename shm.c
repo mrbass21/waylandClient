@@ -1,4 +1,3 @@
-#include <fcntl.h>
 #include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -64,10 +63,11 @@ static int create_tmpfile_cloexec(char *tmpname) {
  */
 
  int os_create_anonymous_file(off_t size) {
-    static const char template[] = "/tutorial-shared-XXXXXX";
+    static const char template[] = "/shm-shared-XXXXXX";
     const char *path;
     char *name;
     int fd;
+    int ret;
 
     path = getenv("XDG_RUNTIME_DIR");
     if(!path) {
@@ -75,12 +75,20 @@ static int create_tmpfile_cloexec(char *tmpname) {
         return -1;
     }
 
-    name = malloc(strlen(path) + sizeof(template));
+    // Calculate required buffer size: strlen(path) + template length + null terminator
+    size_t required_size = strlen(path) + strlen(template) + 1;
+    name = malloc(required_size);
     if(!name) {
         return -1;
     }
-    strcpy(name, path);
-    strcat(name, template);
+
+    // Use snprintf for safe string formatting
+    ret = snprintf(name, required_size, "%s%s", path, template);
+    if (ret < 0 || ret >= (int)required_size) {
+        free(name);
+        errno = ENAMETOOLONG;
+        return -1;
+    }
 
     fd = create_tmpfile_cloexec(name);
     free(name);
