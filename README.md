@@ -1,4 +1,4 @@
-# Wayland Client
+# Handmade Wayland Client
 
 The intention with this codebase is to be a reference or starting point for making a very basic Wayland client. 
 
