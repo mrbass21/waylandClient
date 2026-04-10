@@ -19,6 +19,8 @@
 
 static struct wl_shm *shm = NULL;
 static struct wl_buffer *buffer = NULL;
+static struct wl_shm_pool *pool = NULL;
+static int shm_fd = -1;
 static uint64_t current_buffer_size = 0;
 void *shm_data;
 
@@ -44,6 +46,9 @@ static int gamepad_count_active = 0;
 #define MIN_WIDTH 480
 #define MIN_HEIGHT 320
 
+#define MAX_WIDTH 1920
+#define MAX_HEIGHT 1080
+
 static uint32_t window_width = MIN_WIDTH;
 static uint32_t window_height = MIN_HEIGHT;
 
@@ -60,42 +65,42 @@ static struct client_keyboard_state {
     uint32_t repeat_start_time; // when the key was pressed
 } keyboard_state;
 
-static struct wl_buffer* create_buffer(int width, int height) {
-    printf("Create Buffer!\n");
-    struct wl_shm_pool *pool;
-    int stride = width * 4;
-    int size = stride * height;
-    int fd;
-    static int old_fd = -1;
-    struct wl_buffer *buff;
-
-    fd = os_create_anonymous_file(size);
-    if (fd < 0) {
-        fprintf(stderr, "Failed to create a buffer. size: %d\n", size);
-        exit(1);
-    }
-
-    if(shm_data != NULL) {
-        munmap(shm_data, current_buffer_size);
-    }
-
-    if(old_fd > 0) {
-        close(old_fd);
+static void initialize_buffer_pool() {
+    if (pool != NULL) {
+        return; // Already initialized
     }
     
-    shm_data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if(shm_data == MAP_FAILED) {
-        fprintf(stderr, "mmap failed!\n");
-        close(fd);
+    int max_stride = MAX_WIDTH * 4;
+    int max_size = max_stride * MAX_HEIGHT;
+    
+    shm_fd = os_create_anonymous_file(max_size);
+    if (shm_fd < 0) {
+        fprintf(stderr, "Failed to create buffer pool. size: %d\n", max_size);
         exit(1);
     }
+    
+    shm_data = mmap(NULL, max_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    if (shm_data == MAP_FAILED) {
+        fprintf(stderr, "mmap failed!\n");
+        close(shm_fd);
+        shm_fd = -1;
+        exit(1);
+    }
+    
+    pool = wl_shm_create_pool(shm, shm_fd, max_size);
+    current_buffer_size = max_size;
+}
 
-    pool = wl_shm_create_pool(shm, fd, size);
+static struct wl_buffer* create_buffer(int width, int height) {
+    printf("Create Buffer! %dx%d\n", width, height);
+    
+    initialize_buffer_pool();
+    
+    int stride = width * 4;
+    struct wl_buffer *buff;
+    
     buff = wl_shm_pool_create_buffer(pool, 0, width, height, stride, WL_SHM_FORMAT_ARGB8888);
-    wl_shm_pool_destroy(pool);
-
-    current_buffer_size = size;
-    old_fd = fd;
+    
     return buff;
 }
 
@@ -127,14 +132,15 @@ static const struct wl_callback_listener frame_callback_listener = {
 static void xdg_surface_configure_handler(void *data, struct xdg_surface *xdg_surf, uint32_t serial) {
     xdg_surface_ack_configure(xdg_surf, serial);
 
-    if(buffer != NULL) {
-        wl_buffer_destroy(buffer);
-    }
-
+    struct wl_buffer *old_buffer = buffer;
     buffer = create_buffer(window_width, window_height);
 
     wl_surface_attach(surface, buffer, 0, 0);
     wl_surface_commit(surface);
+
+    if(old_buffer != NULL) {
+        wl_buffer_destroy(old_buffer);
+    }
 }
 
 static const struct xdg_surface_listener xdg_surface_listener = {
@@ -527,16 +533,6 @@ int main(int argc, char *argv[]) {
         
         // Flush to ensure requests reach compositor
         wl_display_flush(display);
-        
-        // Check if buffer needs to be recreated due to window resize
-        if (buffer != NULL) {
-            uint64_t required_size = (uint64_t)window_width * window_height * 4;
-            if (required_size != current_buffer_size) {
-                fprintf(stderr, "Buffer size mismatch, recreating buffer: %lu vs %lu\n", required_size, current_buffer_size);
-                wl_buffer_destroy(buffer);
-                buffer = create_buffer(window_width, window_height);
-            }
-        }
         
         // Process gamepad input
         process_gamepad_input();
