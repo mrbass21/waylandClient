@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdbool.h>
+#include <assert.h>
 
 #include <wayland-client-protocol.h>
 #include <wayland-client.h>
@@ -72,6 +73,9 @@ static void initialize_buffer_pool() {
     
     int max_stride = MAX_WIDTH * 4;
     int max_size = max_stride * MAX_HEIGHT;
+    if(max_size > SIZE_MAX) {
+        exit(1);
+    }
     
     shm_fd = os_create_anonymous_file(max_size);
     if (shm_fd < 0) {
@@ -92,6 +96,7 @@ static void initialize_buffer_pool() {
 }
 
 static struct wl_buffer* create_buffer(int width, int height) {
+    assert(width > 0 && height > 0);
     printf("Create Buffer! %dx%d\n", width, height);
     
     initialize_buffer_pool();
@@ -148,9 +153,12 @@ static const struct xdg_surface_listener xdg_surface_listener = {
 };
 
 static void xdg_toplevel_configure_handler(void *data, struct xdg_toplevel *toplevel, int32_t width, int32_t height, struct wl_array *states) {
+
     fprintf(stderr, "XDG toplevel configure: %dx%d\n", width, height);
-    window_height = (height >= MIN_HEIGHT) ? height : MIN_HEIGHT;
-    window_width = (width >= MIN_WIDTH) ? width : MIN_WIDTH;
+    if (width <= 0 || width > MAX_WIDTH) width = MIN_WIDTH;
+    if (height <= 0 || height > MAX_HEIGHT) height = MIN_HEIGHT;
+    window_height = height;
+    window_width = width;
 }
 
 static void xdg_toplevel_close_handler(void *data, struct xdg_toplevel *toplevel) {
@@ -198,6 +206,7 @@ static void keyboard_keymap_handler(void *data, struct wl_keyboard *keyboard, ui
 }
 
 static void wl_keyboard_modifiers_handler(void *data, struct wl_keyboard *keyboard, uint32_t serial, uint32_t mods_depressed, uint32_t mods_latched, uint32_t mods_locked, uint32_t group) {
+    assert(data != NULL);
     struct client_keyboard_state *client_state = data;
     xkb_state_update_mask(client_state->state, mods_depressed, mods_latched, mods_locked, 0, 0, group);
 }
