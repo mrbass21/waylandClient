@@ -13,6 +13,9 @@
 #include <xkbcommon/xkbcommon.h>
 #include <libudev.h>
 #include <fcntl.h>
+#include <alsa/asoundlib.h>
+#include <math.h>
+#include <errno.h>
 #include <unistd.h>
 #include <linux/joystick.h>
 #include <poll.h>
@@ -460,6 +463,208 @@ static void scanForGamepads() {
     udev_unref(udev);
 }
 
+// Audio system state
+static struct {
+    snd_pcm_t *pcm_handle;
+    unsigned int sample_rate;
+    int16_t *buffer;
+    unsigned int buffer_frames;
+    uint64_t sample_position;  // Track position for continuous waveforms
+    int device_ready;          // Flag to track if device is initialized
+} audio_state = {0};
+
+// Initialize audio system - call this once at startup
+static int init_audio() {
+    int err;
+    snd_pcm_hw_params_t *params;
+    snd_pcm_sw_params_t *swparams;
+    
+    audio_state.sample_rate = 48000;
+    audio_state.buffer_frames = 2048;
+    audio_state.device_ready = 0;
+    
+    // Open PCM device for playback in BLOCKING mode (not non-blocking)
+    err = snd_pcm_open(&audio_state.pcm_handle, "default", SND_PCM_STREAM_PLAYBACK, 0);
+    if (err < 0) {
+        fprintf(stderr, "Failed to open PCM device: %s\n", snd_strerror(err));
+        return -1;
+    }
+    
+    // Allocate hardware parameter structure
+    snd_pcm_hw_params_alloca(&params);
+    
+    // Init hardware parameter structure
+    err = snd_pcm_hw_params_any(audio_state.pcm_handle, params);
+    if (err < 0) {
+        fprintf(stderr, "Cannot configure PCM device: %s\n", snd_strerror(err));
+        snd_pcm_close(audio_state.pcm_handle);
+        return -1;
+    }
+    
+    // Set access type (interleaved)
+    err = snd_pcm_hw_params_set_access(audio_state.pcm_handle, params, SND_PCM_ACCESS_RW_INTERLEAVED);
+    if (err < 0) {
+        fprintf(stderr, "Failed to set access type: %s\n", snd_strerror(err));
+        snd_pcm_close(audio_state.pcm_handle);
+        return -1;
+    }
+    
+    // Set sample format
+    err = snd_pcm_hw_params_set_format(audio_state.pcm_handle, params, SND_PCM_FORMAT_S16_LE);
+    if (err < 0) {
+        fprintf(stderr, "Failed to set format: %s\n", snd_strerror(err));
+        snd_pcm_close(audio_state.pcm_handle);
+        return -1;
+    }
+    
+    // Set number of channels (mono)
+    err = snd_pcm_hw_params_set_channels(audio_state.pcm_handle, params, 1);
+    if (err < 0) {
+        fprintf(stderr, "Failed to set channels: %s\n", snd_strerror(err));
+        snd_pcm_close(audio_state.pcm_handle);
+        return -1;
+    }
+    
+    // Set sample rate
+    unsigned int rate_actual = audio_state.sample_rate;
+    err = snd_pcm_hw_params_set_rate_near(audio_state.pcm_handle, params, &rate_actual, NULL);
+    if (err < 0) {
+        fprintf(stderr, "Failed to set sample rate: %s\n", snd_strerror(err));
+        snd_pcm_close(audio_state.pcm_handle);
+        return -1;
+    }
+    audio_state.sample_rate = rate_actual;
+    
+    // Set period and buffer size for stable playback
+    snd_pcm_uframes_t period_size = 512;
+    snd_pcm_uframes_t buffer_size = 4096;
+    
+    snd_pcm_hw_params_set_period_size_near(audio_state.pcm_handle, params, &period_size, NULL);
+    snd_pcm_hw_params_set_buffer_size_near(audio_state.pcm_handle, params, &buffer_size);
+    
+    // Apply parameters
+    err = snd_pcm_hw_params(audio_state.pcm_handle, params);
+    if (err < 0) {
+        fprintf(stderr, "Failed to set hw params: %s\n", snd_strerror(err));
+        snd_pcm_close(audio_state.pcm_handle);
+        return -1;
+    }
+    
+    // Set software parameters
+    snd_pcm_sw_params_alloca(&swparams);
+    snd_pcm_sw_params_current(audio_state.pcm_handle, swparams);
+    
+    // Start playback when buffer has data
+    snd_pcm_sw_params_set_start_threshold(audio_state.pcm_handle, swparams, 1);
+    snd_pcm_sw_params(audio_state.pcm_handle, swparams);
+    
+    // Prepare PCM for playback
+    snd_pcm_prepare(audio_state.pcm_handle);
+    
+    // Allocate buffer for audio frames
+    audio_state.buffer = malloc(audio_state.buffer_frames * sizeof(int16_t));
+    if (!audio_state.buffer) {
+        fprintf(stderr, "Failed to allocate audio buffer\n");
+        snd_pcm_close(audio_state.pcm_handle);
+        return -1;
+    }
+    
+    audio_state.device_ready = 1;
+    fprintf(stderr, "Audio initialized: %d Hz, 16-bit mono, period=%lu, buffer=%lu\n", 
+            audio_state.sample_rate, period_size, buffer_size);
+    
+    // Pre-fill buffer to avoid initial underrun
+    int16_t initial_buffer[4096];
+    for (int i = 0; i < 4096; i++) {
+        initial_buffer[i] = 0;  // Silent fill
+    }
+    snd_pcm_writei(audio_state.pcm_handle, initial_buffer, 4096);
+    
+    return 0;
+}
+
+// Get audio bytes for the given deltaTime
+// frequency_hz: frequency of sine wave to generate
+// delta_time_seconds: time elapsed since last call
+// Returns: number of samples written to audio device, or -1 on error
+static int get_sound_bytes(int frequency_hz, float delta_time_seconds) {
+    if (!audio_state.device_ready || !audio_state.pcm_handle) {
+        return -1;
+    }
+    
+    // Calculate how many frames to generate for this delta time
+    unsigned int frames_to_generate = (unsigned int)(delta_time_seconds * audio_state.sample_rate);
+    if (frames_to_generate == 0) return 0;
+    
+    // Ensure we don't overflow buffer
+    if (frames_to_generate > audio_state.buffer_frames) {
+        frames_to_generate = audio_state.buffer_frames;
+    }
+    
+    // Generate sine wave samples
+    for (unsigned int i = 0; i < frames_to_generate; i++) {
+        float angle = 2.0f * M_PI * frequency_hz * (audio_state.sample_position + i) / (float)audio_state.sample_rate;
+        float sample = sinf(angle);
+        // Convert to 16-bit signed integer with 0.7 factor to avoid clipping
+        audio_state.buffer[i] = (int16_t)(sample * 32767.0f * 0.7f);
+    }
+    
+    // Try to write, but don't block long. If buffer is full, skip this frame.
+    snd_pcm_sframes_t frames_out = snd_pcm_writei(audio_state.pcm_handle, audio_state.buffer, frames_to_generate);
+    
+    if (frames_out < 0) {
+        // Handle underrun/error
+        if (frames_out == -EPIPE || frames_out == -ESTRPIPE) {
+            // Underrun - quietly recover without output spam
+            snd_pcm_prepare(audio_state.pcm_handle);
+            
+            // Retry once
+            frames_out = snd_pcm_writei(audio_state.pcm_handle, audio_state.buffer, frames_to_generate);
+            if (frames_out < 0) {
+                return 0;
+            }
+        } else if (frames_out == -EAGAIN || frames_out == -EWOULDBLOCK) {
+            // Buffer temporarily full, skip this frame (non-blocking would return this)
+            return 0;
+        } else {
+            fprintf(stderr, "PCM write error: %s\n", snd_strerror(frames_out));
+            return 0;
+        }
+    }
+    
+    if (frames_out > 0) {
+        audio_state.sample_position += frames_out;
+    }
+    
+    return frames_out;
+}
+
+// Cleanup audio system - call this on shutdown
+static void cleanup_audio() {
+    if (audio_state.pcm_handle) {
+        snd_pcm_drain(audio_state.pcm_handle);
+        snd_pcm_close(audio_state.pcm_handle);
+        audio_state.pcm_handle = NULL;
+    }
+    if (audio_state.buffer) {
+        free(audio_state.buffer);
+        audio_state.buffer = NULL;
+    }
+}
+
+// Test function - generates varying tones
+static int test_get_sound_bytes(float delta_time_seconds) {
+    static float test_timer = 0.0f;
+    test_timer += delta_time_seconds;
+    
+    // Cycle through different frequencies every second
+    int frequencies[] = {440, 550, 660, 880};  // A notes
+    int freq_index = ((int)test_timer) % 4;
+    int frequency = frequencies[freq_index];
+    
+    return get_sound_bytes(frequency, delta_time_seconds);
+}
+
 int main(int argc, char *argv[]) {
     display = wl_display_connect(NULL);
     if(display == NULL) {
@@ -522,6 +727,12 @@ int main(int argc, char *argv[]) {
     // Find game pads
     scanForGamepads();
 
+    // Initialize audio system
+    if (init_audio() < 0) {
+        fprintf(stderr, "Failed to initialize audio\n");
+        exit(1);
+    }
+
     #define TARGET_FPS 60
     #define FRAME_TIME_MS (1000 / TARGET_FPS)  // 16ms for 60 FPS
     #define FRAME_TIME_US (FRAME_TIME_MS * 1000)
@@ -534,6 +745,10 @@ int main(int argc, char *argv[]) {
         
         // Update game state and render
         redraw_frame();
+        
+        // Generate audio for this frame (test implementation)
+        float delta_time = FRAME_TIME_MS / 1000.0f;  // Convert to seconds
+        test_get_sound_bytes(delta_time);  // Cycles through tones every second
         
         // Commit the buffer to Wayland
         wl_surface_attach(surface, buffer, 0, 0);
@@ -568,6 +783,8 @@ int main(int argc, char *argv[]) {
             usleep(FRAME_TIME_US - elapsed);
         }
     }
+
+    cleanup_audio();
 
     close_gamepads();
 

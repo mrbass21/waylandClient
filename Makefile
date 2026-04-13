@@ -1,6 +1,6 @@
 CC = gcc
 CFLAGS = -g
-LDFLAGS = -lwayland-client -lxkbcommon -ludev
+LDFLAGS = -lwayland-client -lxkbcommon -ludev -lasound -lm
 CPPFLAGS = -DUSE_SHM
 
 WAYLAND_SCANNER = wayland-scanner

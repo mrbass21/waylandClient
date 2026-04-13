@@ -8,7 +8,7 @@ Features:
  - [x] Draw a window with client side decorations
  - [x] Accept keyboard input
  - [x] Accept controller input
- - [ ] Write sound
+ - [x] Write sound
 
  My intention is to get all the basic client operations filled in as Handmade Hero uses. The main branch will contain the "final" client code to take and just jump into doing the game code.
 
